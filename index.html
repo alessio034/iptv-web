@@ -59,6 +59,14 @@
   #customRow { display: none; gap: 8px; width: 100%; }
   #customRow.on { display: flex; }
   #customUrl { flex: 1; }
+  .chk { display: flex; align-items: center; gap: 6px; color: var(--muted); cursor: pointer; white-space: nowrap; }
+  .chk input { accent-color: var(--accent); width: 16px; height: 16px; }
+  #checkInfo { white-space: nowrap; }
+  #checkInfo b { color: #4cd07d; font-weight: 600; }
+  .card.bad { opacity: .45; }
+  .card .dot { position: absolute; top: 9px; left: 9px; width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+  .card .dot.ok { background: #4cd07d; }
+  .card .dot.bad { background: var(--accent); }
   @media (max-width: 700px) {
     .layout { grid-template-columns: 1fr; }
     aside { position: static; max-height: none; display: flex; overflow-x: auto; gap: 4px; }
@@ -95,6 +103,9 @@
     </optgroup>
   </select>
   <input id="search" type="search" placeholder="Buscar canal…">
+  <label class="chk" title="Revisa cada canal y oculta los que no cargan en el navegador">
+    <input type="checkbox" id="onlyOk"> Solo los que funcionan</label>
+  <span class="status" id="checkInfo"></span>
   <div id="customRow">
     <input id="customUrl" type="url" placeholder="https://…/lista.m3u">
     <button class="primary" id="loadUrl">Cargar</button>
@@ -142,6 +153,108 @@ const store = {
 
 let channels = [], visible = [], current = -1, group = ALL_GROUP, hls = null;
 let favs = new Set(store.get('favs', []));
+let onlyOk = store.get('onlyOk', true);
+
+// --- Verificación de canales
+// En el navegador un canal sirve si su lista .m3u8 se puede descargar (CORS) y no es http:// en una página https.
+const HEALTH_TTL = 6 * 3600 * 1000, PROBE_TIMEOUT = 6000, PROBE_PARALLEL = 32;
+const health = new Map(Object.entries(store.get('health', {}))
+  .filter(([, v]) => Date.now() - v[1] < HEALTH_TTL));            // url -> [ok(bool), fecha]
+const isOk = c => health.get(c.url)?.[0] === true;
+const isBad = c => health.get(c.url)?.[0] === false;
+let checkRun = 0, checkDone = 0, checkTotal = 0, checking = false, dirty = false;
+
+function mark(url, ok) { health.set(url, [ok, Date.now()]); dirty = true; }
+function saveHealth() { store.set('health', Object.fromEntries(health)); }
+
+async function fetchText(url, signal) {
+  const res = await fetch(url, { signal, cache: 'no-store' });
+  if (!res.ok) throw new Error('HTTP ' + res.status);
+  return { text: await res.text(), url: res.url || url };
+}
+
+async function probe(url) {
+  if (location.protocol === 'https:' && /^http:/i.test(url)) return false;   // el navegador lo bloquearía
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), PROBE_TIMEOUT);
+  try {
+    if (/\.(mp4|webm|mp3|aac)(\?|$)/i.test(url)) {
+      const res = await fetch(url, { signal: ctl.signal, headers: { Range: 'bytes=0-1' } });
+      ctl.abort();
+      return res.ok;
+    }
+    const m = await fetchText(url, ctl.signal);
+    if (!m.text.trimStart().startsWith('#EXTM3U')) return false;
+    if (!m.text.includes('#EXT-X-STREAM-INF')) return true;
+    // Lista maestra: probar también la primera calidad
+    const lines = m.text.split(/\r?\n/);
+    const i = lines.findIndex(l => l.startsWith('#EXT-X-STREAM-INF'));
+    const next = lines.slice(i + 1).find(l => l.trim() && !l.startsWith('#'));
+    if (!next) return false;
+    const sub = new URL(next.trim(), m.url).href;
+    if (location.protocol === 'https:' && /^http:/i.test(sub)) return false;
+    const v = await fetchText(sub, ctl.signal);
+    return v.text.trimStart().startsWith('#EXTM3U');
+  } catch { return false; }
+  finally { clearTimeout(t); }
+}
+
+// El navegador abre pocas conexiones por servidor: se reparte la fila entre servidores.
+function interleaveHosts(urls) {
+  const byHost = new Map();
+  for (const u of urls) {
+    let h; try { h = new URL(u).host; } catch { h = ''; }
+    if (!byHost.has(h)) byHost.set(h, []);
+    byHost.get(h).push(u);
+  }
+  const queues = [...byHost.values()], out = [];
+  for (let i = 0; out.length < urls.length; i++)
+    for (const q of queues) if (i < q.length) out.push(q[i]);
+  return out;
+}
+
+async function verifyAll() {
+  const run = ++checkRun;
+  const todo = interleaveHosts([...new Set(channels.filter(c => !health.has(c.url)).map(c => c.url))]);
+  checkTotal = todo.length; checkDone = 0; checking = todo.length > 0;
+  updateCheckInfo();
+  let next = 0;
+  const worker = async () => {
+    while (next < todo.length && run === checkRun) {
+      const url = todo[next++];
+      const ok = await probe(url);
+      if (run !== checkRun) return;
+      mark(url, ok); checkDone++;
+    }
+  };
+  const tick = setInterval(() => { if (run === checkRun) refresh(); }, 1000);
+  await Promise.all(Array.from({ length: Math.min(PROBE_PARALLEL, todo.length) }, worker));
+  clearInterval(tick);
+  if (run !== checkRun) return;
+  checking = false;
+  refresh();
+}
+
+// Redibuja solo si cambió algo (cada segundo mientras se verifica)
+function refresh() {
+  updateCheckInfo();
+  if (!dirty) return;
+  dirty = false;
+  saveHealth();
+  renderGroups(); render();
+}
+
+function updateCheckInfo() {
+  const ok = channels.filter(isOk).length;
+  const el = $('checkInfo');
+  if (!channels.length) { el.textContent = ''; return; }
+  el.innerHTML = `<b></b>`;
+  el.firstChild.textContent = `✔ ${ok} de ${channels.length} funcionan`;
+  if (checking) el.append(` · revisando ${checkDone}/${checkTotal}…`);
+}
+
+// Canales que se pueden mostrar según el interruptor
+const pool = () => onlyOk ? channels.filter(isOk) : channels;
 
 // --- M3U parser: #EXTINF:-1 tvg-id="" tvg-logo="" group-title="",Nombre \n URL
 function parseM3U(text) {
@@ -197,17 +310,19 @@ function setChannels(list, msg) {
   group = ALL_GROUP;
   renderGroups();
   render(msg);
+  if (channels.length) verifyAll(); else { checkRun++; checking = false; updateCheckInfo(); }
 }
 
 function renderGroups() {
+  const list = pool();
   const counts = {};
-  for (const c of channels) counts[c.group] = (counts[c.group] || 0) + 1;
-  const favCount = channels.filter(c => favs.has(c.key)).length;
+  for (const c of list) counts[c.group] = (counts[c.group] || 0) + 1;
+  const favCount = list.filter(c => favs.has(c.key)).length;
   const names = [ALL_GROUP, FAV_GROUP, ...Object.keys(counts).sort((a, b) => a.localeCompare(b))];
   $('groups').innerHTML = '';
   for (const g of names) {
-    const n = g === ALL_GROUP ? channels.length : g === FAV_GROUP ? favCount : counts[g];
-    if (g === FAV_GROUP && !n) continue;
+    const n = g === ALL_GROUP ? list.length : g === FAV_GROUP ? favCount : counts[g];
+    if (g === FAV_GROUP && !n && group !== FAV_GROUP) continue;
     const b = document.createElement('button');
     b.className = g === group ? 'active' : '';
     b.innerHTML = `<span></span><small>${n}</small>`;
@@ -219,16 +334,19 @@ function renderGroups() {
 
 function render(msg) {
   const q = $('search').value.trim().toLowerCase();
-  visible = channels.filter(c =>
+  visible = pool().filter(c =>
     (group === ALL_GROUP || (group === FAV_GROUP ? favs.has(c.key) : c.group === group)) &&
     (!q || c.name.toLowerCase().includes(q)));
+  if (playingKey) { const j = visible.findIndex(c => c.key === playingKey); if (j >= 0) current = j; }
   const grid = $('grid');
   grid.innerHTML = '';
   const frag = document.createDocumentFragment();
   visible.forEach((c, i) => {
     const d = document.createElement('div');
-    d.className = 'card' + (playingKey === c.key ? ' playing' : '');
-    d.innerHTML = `<button class="fav ${favs.has(c.key) ? 'on' : ''}" title="Favorito">★</button>
+    const st = isOk(c) ? 'ok' : isBad(c) ? 'bad' : '';
+    d.className = 'card' + (playingKey === c.key ? ' playing' : '') + (st === 'bad' ? ' bad' : '');
+    d.innerHTML = `<span class="dot ${st}" title="${st === 'ok' ? 'Funciona' : st === 'bad' ? 'No carga en el navegador' : 'Revisando…'}"></span>
+      <button class="fav ${favs.has(c.key) ? 'on' : ''}" title="Favorito">★</button>
       <div class="thumb"></div><div class="name"></div><div class="grp"></div>`;
     const thumb = d.querySelector('.thumb');
     if (c.logo) {
@@ -244,7 +362,10 @@ function render(msg) {
   });
   grid.appendChild(frag);
   $('empty').style.display = visible.length ? 'none' : 'block';
-  $('empty').textContent = msg || (channels.length ? 'No hay canales que coincidan.' : 'Sin canales.');
+  $('empty').textContent = msg || (!channels.length ? 'Sin canales.'
+    : onlyOk && checking && !pool().length ? 'Buscando canales que funcionen…'
+    : onlyOk && !pool().length ? 'Ningún canal de esta lista carga en el navegador. Prueba otra lista o desmarca "Solo los que funcionan".'
+    : 'No hay canales que coincidan.');
 }
 
 const initials = s => s.replace(/[^\p{L}\p{N} ]/gu, '').split(' ').filter(Boolean).slice(0, 2).map(w => w[0]).join('').toUpperCase() || 'TV';
@@ -280,6 +401,7 @@ function play(i) {
       if (!data.fatal) return;
       if (data.type === Hls.ErrorTypes.MEDIA_ERROR) { hls.recoverMediaError(); return; }
       setStatus('No disponible (' + (data.details || data.type) + ')', true);
+      if (data.type === Hls.ErrorTypes.NETWORK_ERROR) { mark(c.url, false); saveHealth(); }
     });
   } else {
     video.src = c.url;
@@ -300,6 +422,8 @@ function stop() {
 // --- Eventos
 $('source').onchange = e => loadSource(e.target.value);
 $('search').oninput = () => render();
+$('onlyOk').checked = onlyOk;
+$('onlyOk').onchange = e => { onlyOk = e.target.checked; store.set('onlyOk', onlyOk); renderGroups(); render(); };
 $('loadUrl').onclick = () => { const u = $('customUrl').value.trim(); if (u) { store.set('customUrl', u); loadUrl(u); } };
 $('file').onchange = async e => { const f = e.target.files[0]; if (f) setChannels(parseM3U(await f.text())); };
 $('prev').onclick = () => play(current - 1);
